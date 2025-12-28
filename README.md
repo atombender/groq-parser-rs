@@ -1,0 +1,53 @@
+# groq-parser
+
+A Rust parser for [GROQ](https://www.sanity.io/docs/groq) (Graph-Relational Object Queries), the
+query language created by Sanity.io for filtering and projecting JSON documents.
+
+## Features
+
+- Complete GROQ language support
+- Minimal dependencies
+- Comprehensive error handling with source position tracking
+- Extensively tested (~98 test cases)
+
+## Installation
+
+Add to your `Cargo.toml`:
+
+```toml
+[dependencies]
+groq-parser = { path = "path/to/groq-parser" }
+```
+
+## Usage
+
+```rust
+use groq_parser::parser::Parser;
+
+fn main() {
+  let query = r#"*[_type == "post"]{title, author->name}"#;
+  let mut parser = Parser::new(query);
+
+  match parser.parse() {
+    Ok(expr) => println!("{:?}", expr),
+    Err(e) => eprintln!("Parse error: {}", e),
+  }
+}
+```
+
+## Building
+
+```bash
+# Debug build
+cargo build
+
+# Release build (optimized)
+cargo build --release
+
+# Run tests
+cargo test --lib
+```
+
+## License
+
+MIT License - see [LICENSE](LICENSE) for details.
