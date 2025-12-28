@@ -6,6 +6,7 @@ use crate::ast::*;
 use crate::parser::operators::*;
 use crate::tokenizer::Tokenizer;
 use std::collections::HashSet;
+use std::fmt;
 
 #[derive(Debug)]
 pub struct ParseError {
@@ -13,9 +14,10 @@ pub struct ParseError {
     pub pos: Position,
 }
 
-impl std::fmt::Display for ParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} at {:?}", self.message, self.pos)
+impl fmt::Display for ParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let result = write!(f, "{} at {:?}", self.message, self.pos);
+        result
     }
 }
 
@@ -171,10 +173,7 @@ impl<'a> Parser<'a> {
             for (param_name, param_pos) in &self.referenced_params {
                 if !self.config.params.contains(param_name) {
                     return Err(Box::new(ParseError {
-                        message: format!(
-                            "param ${} referenced, but not provided",
-                            param_name
-                        ),
+                        message: format!("param ${} referenced, but not provided", param_name),
                         pos: *param_pos,
                     }));
                 }
@@ -845,16 +844,17 @@ impl<'a> Parser<'a> {
                 }
 
                 let func_opt = self.parse_function_expression(Token::DoubleColon, f_lit, f_pos)?;
-                if let Some(mut func) = func_opt {
+
+                return if let Some(mut func) = func_opt {
                     func.namespace = name.to_string();
                     func.pos.start = name_pos;
-                    return Ok(Some(func));
+                    Ok(Some(func))
                 } else {
-                    return Err(Box::new(ParseError {
+                    Err(Box::new(ParseError {
                         message: "expected a function following namespace expression".to_string(),
                         pos: self.make_token_pos(f_pos, f_lit),
-                    }));
-                }
+                    }))
+                };
             }
             Token::ParenLeft => {
                 // Fall through to parse arguments
