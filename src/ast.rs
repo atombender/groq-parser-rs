@@ -4,6 +4,24 @@ pub struct Position {
     pub end: usize,
 }
 
+/// Trait for AST nodes that have source position information.
+pub trait HasPosition {
+    fn get_pos(&self) -> Position;
+}
+
+/// Macro to implement HasPosition for structs with a `pos` field.
+macro_rules! impl_has_position {
+    ($($t:ty),+ $(,)?) => {
+        $(
+            impl HasPosition for $t {
+                fn get_pos(&self) -> Position {
+                    self.pos
+                }
+            }
+        )+
+    };
+}
+
 #[derive(Debug, Clone, PartialEq, Copy)]
 pub enum Token {
     Illegal,
@@ -378,4 +396,84 @@ pub struct FunctionDefinition {
 pub struct FunctionParamDefinition {
     pub index: usize,
     pub name: String,
+}
+
+// Implement HasPosition for all struct types with a `pos` field
+impl_has_position!(
+    Everything,
+    This,
+    Parent,
+    Constraint,
+    Object,
+    Array,
+    Subscript,
+    Range,
+    FunctionCall,
+    BinaryOperator,
+    DotOperator,
+    ArrayTraversal,
+    Group,
+    Tuple,
+    PipeOperator,
+    PrefixOperator,
+    PostfixOperator,
+    Attribute,
+    Param,
+    StringLiteral,
+    IntegerLiteral,
+    FloatLiteral,
+    BooleanLiteral,
+    NullLiteral,
+    Ellipsis,
+    Projection,
+    FunctionPipe,
+    Filter,
+    Element,
+    Slice,
+    FunctionDefinition,
+);
+
+impl HasPosition for Literal {
+    fn get_pos(&self) -> Position {
+        match self {
+            Literal::String(lit) => lit.get_pos(),
+            Literal::Integer(lit) => lit.get_pos(),
+            Literal::Float(lit) => lit.get_pos(),
+            Literal::Boolean(lit) => lit.get_pos(),
+            Literal::Null(lit) => lit.get_pos(),
+        }
+    }
+}
+
+impl HasPosition for Expr {
+    fn get_pos(&self) -> Position {
+        match self {
+            Expr::Everything(node) => node.get_pos(),
+            Expr::This(node) => node.get_pos(),
+            Expr::Parent(node) => node.get_pos(),
+            Expr::Constraint(node) => node.get_pos(),
+            Expr::Object(node) => node.get_pos(),
+            Expr::Array(node) => node.get_pos(),
+            Expr::Subscript(node) => node.get_pos(),
+            Expr::Range(node) => node.get_pos(),
+            Expr::FunctionCall(node) => node.get_pos(),
+            Expr::Binary(node) => node.get_pos(),
+            Expr::Dot(node) => node.get_pos(),
+            Expr::ArrayTraversal(node) => node.get_pos(),
+            Expr::Group(node) => node.get_pos(),
+            Expr::Tuple(node) => node.get_pos(),
+            Expr::Pipe(node) => node.get_pos(),
+            Expr::Prefix(node) => node.get_pos(),
+            Expr::Postfix(node) => node.get_pos(),
+            Expr::Attribute(node) => node.get_pos(),
+            Expr::Param(node) => node.get_pos(),
+            Expr::Literal(lit) => lit.get_pos(),
+            Expr::Projection(node) => node.get_pos(),
+            Expr::FunctionPipe(node) => node.get_pos(),
+            Expr::Filter(node) => node.get_pos(),
+            Expr::Element(node) => node.get_pos(),
+            Expr::Slice(node) => node.get_pos(),
+            Expr::Ellipsis(node) => node.get_pos(),
+        }
+    }
 }
