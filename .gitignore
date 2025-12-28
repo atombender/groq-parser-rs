@@ -1,2 +1,3 @@
-target
-target
+/target/
+/groq-test-suite.ndjson
+/comparison/go-dumper/go-dumper

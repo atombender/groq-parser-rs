@@ -5,6 +5,7 @@ mod tests;
 use crate::ast::*;
 use crate::parser::operators::*;
 use crate::tokenizer::Tokenizer;
+use std::collections::HashSet;
 
 #[derive(Debug)]
 pub struct ParseError {
@@ -20,22 +21,84 @@ impl std::fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
+/// Configuration for the parser.
+#[derive(Debug, Clone, Default)]
+pub struct ParserConfig {
+    /// Set of parameter names that are valid (without the $ prefix).
+    /// If validate_params is true and a param is referenced that's not in this set,
+    /// parsing will fail.
+    pub params: HashSet<String>,
+
+    /// Whether to validate that referenced parameters exist in the params set.
+    /// Default: true (matches Go behavior).
+    pub validate_params: bool,
+}
+
+impl ParserConfig {
+    /// Create a new config with parameter validation enabled and an empty param set.
+    /// This matches Go's default behavior where params must be provided.
+    pub fn new() -> Self {
+        ParserConfig {
+            params: HashSet::new(),
+            validate_params: true,
+        }
+    }
+
+    /// Create a config that skips parameter validation.
+    pub fn without_param_validation() -> Self {
+        ParserConfig {
+            params: HashSet::new(),
+            validate_params: false,
+        }
+    }
+
+    /// Add a parameter name to the valid set.
+    pub fn with_param(mut self, name: &str) -> Self {
+        self.params.insert(name.to_string());
+        self
+    }
+
+    /// Add multiple parameter names to the valid set.
+    pub fn with_params<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        for name in names {
+            self.params.insert(name.as_ref().to_string());
+        }
+        self
+    }
+}
+
 pub struct Parser<'a> {
     tk: Tokenizer<'a>,
     buf_tok: Token,
     buf_lit: &'a str,
     buf_pos: usize,
     has_buf: bool,
+    config: ParserConfig,
+    /// Tracks all parameter references found during parsing (name, position)
+    referenced_params: Vec<(String, Position)>,
 }
 
 impl<'a> Parser<'a> {
+    /// Create a new parser without parameter validation.
+    /// Use `new_with_config` for parameter validation (Go's default behavior).
     pub fn new(src: &'a str) -> Self {
+        Self::new_with_config(src, ParserConfig::without_param_validation())
+    }
+
+    /// Create a new parser with the given configuration.
+    pub fn new_with_config(src: &'a str, config: ParserConfig) -> Self {
         Parser {
             tk: Tokenizer::new(src),
             buf_tok: Token::Illegal,
             buf_lit: "",
             buf_pos: 0,
             has_buf: false,
+            config,
+            referenced_params: Vec::new(),
         }
     }
 
@@ -101,6 +164,21 @@ impl<'a> Parser<'a> {
                 message: "unable to parse entire expression".to_string(),
                 pos: self.make_pos(pos, pos),
             }));
+        }
+
+        // Validate parameter references if enabled
+        if self.config.validate_params {
+            for (param_name, param_pos) in &self.referenced_params {
+                if !self.config.params.contains(param_name) {
+                    return Err(Box::new(ParseError {
+                        message: format!(
+                            "param ${} referenced, but not provided",
+                            param_name
+                        ),
+                        pos: *param_pos,
+                    }));
+                }
+            }
         }
 
         Ok(result)
@@ -537,8 +615,12 @@ impl<'a> Parser<'a> {
         match tok {
             Token::Name => {
                 if let Some(stripped) = lit.strip_prefix('$') {
+                    let param_pos = self.make_token_pos(pos, lit);
+                    // Track this parameter reference for validation
+                    self.referenced_params
+                        .push((stripped.to_string(), param_pos));
                     return Ok(Some(Expr::Param(Param {
-                        pos: self.make_token_pos(pos, lit),
+                        pos: param_pos,
                         name: stripped.to_string(),
                     })));
                 }
