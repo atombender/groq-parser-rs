@@ -5,10 +5,15 @@ query language created by Sanity.io for filtering and projecting JSON documents.
 
 ## Features
 
-- Complete GROQ language support
+- Complete GROQ language support (version 1.3)
 - Minimal dependencies
 - Comprehensive error handling with source position tracking
 - Extensively tested (~98 test cases)
+
+## Compatibility
+
+This library may return floating point numbers that differ from the reference implementation
+due to differences in floating point representation and evaluation in Rust.
 
 ## Installation
 
@@ -79,27 +84,6 @@ Filter by GROQ spec version (excludes legacy 0.1 tests):
 ```bash
 python3 compare.py ../groq-test-suite.ndjson ../target/release/dump_ast ./go-dumper/go-dumper --version 1.3
 ```
-
-### Current Results (GROQ 1.3)
-
-| Metric          | Count         | Notes                             |
-|-----------------|---------------|-----------------------------------|
-| Total tests     | 9,867         | (287 legacy 0.1 tests excluded)   |
-| Matching        | 8,971 (90.9%) |                                   |
-| Status mismatch | 0             |                                   |
-| AST mismatch    | 896           | Numeric & param expansion diffs   |
-
-**AST mismatches** fall into two categories:
-
-1. **Numeric formatting** (cosmetic):
-   - Float precision (1736 line diffs): Minor floating-point representation differences
-   - Float notation (4 line diffs): Different scientific notation thresholds
-   - Integer overflow (4 line diffs): Rust uses Float for values > i64::MAX (more precise),
-     Go clamps to i64::MAX
-
-2. **Parameter expansion** (526 line diffs): Go expands `$param` references to their literal
-   values at parse time. Rust keeps them as `Param` nodes, which is the correct parser behavior
-   (evaluation/interpolation is separate from parsing).
 
 ## License
 
