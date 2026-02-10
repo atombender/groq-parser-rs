@@ -7,6 +7,7 @@ fn parse(src: &str) -> Expr {
     parser
         .parse()
         .unwrap_or_else(|e| panic!("Failed to parse '{}': {}", src, e))
+        .expr
 }
 
 // Helper to assert parse succeeds
@@ -449,6 +450,35 @@ fn test_function_definitions() {
     assert_parses("fn my::func($a) = $a; *");
     assert_parses("fn ns::identity($x) = $x; count(*)");
     assert_parses("fn math::double($n) = $n * 2; *");
+}
+
+#[test]
+fn test_parse_custom_function() {
+    let mut parser = Parser::new(
+        "fn pt::isPublished($doc) = !(_id in path('drafts.**')); *[pt::isPublished(@)]",
+    );
+    let result = parser.parse().unwrap();
+    assert_eq!(result.functions.len(), 1);
+    assert_eq!(result.functions[0].id.namespace, "pt");
+    assert_eq!(result.functions[0].id.name, "isPublished");
+    assert_eq!(result.functions[0].parameters.len(), 1);
+    assert_eq!(result.functions[0].parameters[0].name, "doc");
+}
+
+#[test]
+fn test_parse_multiple_function_definitions() {
+    let mut parser = Parser::new("fn math::double($n) = $n * 2; fn math::triple($n) = $n * 3; *");
+    let result = parser.parse().unwrap();
+    assert_eq!(result.functions.len(), 2);
+    assert_eq!(result.functions[0].id.name, "double");
+    assert_eq!(result.functions[1].id.name, "triple");
+}
+
+#[test]
+fn test_parse_no_functions() {
+    let mut parser = Parser::new("*[_type == \"movie\"]");
+    let result = parser.parse().unwrap();
+    assert_eq!(result.functions.len(), 0);
 }
 
 // ==================== COMMENTS ====================

@@ -146,7 +146,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    pub fn parse(&mut self) -> Result<Expr, Box<dyn std::error::Error>> {
+    pub fn parse(&mut self) -> Result<ParseResult, Box<dyn std::error::Error>> {
         let (tok, _, _) = self.scan_ignore_whitespace();
         if tok == Token::EOF {
             return Err(Box::new(ParseError {
@@ -156,9 +156,9 @@ impl<'a> Parser<'a> {
         }
         self.unscan();
 
-        self.parse_function_definitions()?;
+        let functions = self.parse_function_definitions()?;
 
-        let result = self.parse_general_expression(1, false, false)?;
+        let expr = self.parse_general_expression(1, false, false)?;
 
         let (tok, _, pos) = self.scan_ignore_whitespace();
         if tok != Token::EOF {
@@ -180,20 +180,23 @@ impl<'a> Parser<'a> {
             }
         }
 
-        Ok(result)
+        Ok(ParseResult { expr, functions })
     }
 
-    fn parse_function_definitions(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    fn parse_function_definitions(
+        &mut self,
+    ) -> Result<Vec<FunctionDefinition>, Box<dyn std::error::Error>> {
+        let mut functions = Vec::new();
         loop {
             let (tok, lit, _) = self.scan_ignore_whitespace();
             if tok == Token::Name && lit == "fn" {
-                let _func_def = self.parse_function_definition()?;
+                functions.push(self.parse_function_definition()?);
             } else {
                 self.unscan();
                 break;
             }
         }
-        Ok(())
+        Ok(functions)
     }
 
     fn parse_function_definition(

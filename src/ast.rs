@@ -378,6 +378,14 @@ pub struct Slice {
     pub range: Subscript,
 }
 
+/// The result of parsing a GROQ query, containing both the main expression
+/// and any custom function definitions.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParseResult {
+    pub expr: Expr,
+    pub functions: Vec<FunctionDefinition>,
+}
+
 #[derive(Debug, Clone, PartialEq, Hash, Eq)]
 pub struct FunctionID {
     pub namespace: String,

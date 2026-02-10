@@ -64,10 +64,10 @@ fn main() {
 
         let mut parser = Parser::new_with_config(query, config);
         match parser.parse() {
-            Ok(expr) => {
+            Ok(result) => {
                 writeln!(stdout, "status: ok").unwrap();
                 writeln!(stdout, "ast:").unwrap();
-                let dump = dump_expr(&expr);
+                let dump = dump_expr(&result.expr);
                 for line in dump.lines() {
                     writeln!(stdout, "  {}", line).unwrap();
                 }

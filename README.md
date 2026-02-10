@@ -34,7 +34,7 @@ fn main() {
   let mut parser = Parser::new(query);
 
   match parser.parse() {
-    Ok(expr) => println!("{:?}", expr),
+    Ok(result) => println!("{:?}", result.expr),
     Err(e) => eprintln!("Parse error: {}", e),
   }
 }
