@@ -7,17 +7,12 @@ const EOF_CHAR: char = '\0';
 
 pub struct Tokenizer<'a> {
     src: &'a str,
-    bytes: &'a [u8],
     pos: usize,
 }
 
 impl<'a> Tokenizer<'a> {
     pub fn new(src: &'a str) -> Self {
-        Tokenizer {
-            src,
-            bytes: src.as_bytes(),
-            pos: 0,
-        }
+        Tokenizer { src, pos: 0 }
     }
 
     pub fn pos(&self) -> usize {
@@ -26,27 +21,19 @@ impl<'a> Tokenizer<'a> {
 
     #[inline]
     fn peek(&self) -> char {
-        if self.pos >= self.bytes.len() {
-            EOF_CHAR
-        } else {
-            self.bytes[self.pos] as char
-        }
+        self.src[self.pos..].chars().next().unwrap_or(EOF_CHAR)
     }
 
     #[inline]
     fn peek_at(&self, offset: usize) -> char {
-        let idx = self.pos + offset;
-        if idx >= self.bytes.len() {
-            EOF_CHAR
-        } else {
-            self.bytes[idx] as char
-        }
+        // offset is in characters, not bytes
+        self.src[self.pos..].chars().nth(offset).unwrap_or(EOF_CHAR)
     }
 
     #[inline]
     fn advance(&mut self) {
-        if self.pos < self.bytes.len() {
-            self.pos += 1;
+        if let Some(ch) = self.src[self.pos..].chars().next() {
+            self.pos += ch.len_utf8();
         }
     }
 
