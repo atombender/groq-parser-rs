@@ -71,10 +71,12 @@ impl<'a> Tokenizer<'a> {
                 while self.peek() != EOF_CHAR && self.peek() != '\n' {
                     self.advance();
                 }
+                let lit = self.slice(pos, self.pos);
+                // Consume the newline but don't include it in the token literal
                 if self.peek() == '\n' {
                     self.advance();
                 }
-                return self.scan();
+                return (Token::Comment, lit, pos);
             } else {
                 return (Token::Slash, self.slice(pos, self.pos), pos);
             }

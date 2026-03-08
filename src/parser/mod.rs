@@ -34,6 +34,10 @@ pub struct ParserConfig {
     /// Whether to validate that referenced parameters exist in the params set.
     /// Default: true (matches Go behavior).
     pub validate_params: bool,
+
+    /// Whether to collect comments and include them in the parse result.
+    /// Default: false (comments are silently skipped).
+    pub preserve_comments: bool,
 }
 
 impl ParserConfig {
@@ -43,6 +47,7 @@ impl ParserConfig {
         ParserConfig {
             params: HashSet::new(),
             validate_params: true,
+            preserve_comments: false,
         }
     }
 
@@ -51,12 +56,19 @@ impl ParserConfig {
         ParserConfig {
             params: HashSet::new(),
             validate_params: false,
+            preserve_comments: false,
         }
     }
 
     /// Add a parameter name to the valid set.
     pub fn with_param(mut self, name: &str) -> Self {
         self.params.insert(name.to_string());
+        self
+    }
+
+    /// Enable comment preservation in the parse result.
+    pub fn with_comments(mut self) -> Self {
+        self.preserve_comments = true;
         self
     }
 
@@ -82,6 +94,8 @@ pub struct Parser<'a> {
     config: ParserConfig,
     /// Tracks all parameter references found during parsing (name, position)
     referenced_params: Vec<(String, Position)>,
+    /// Comments collected during parsing (when preserve_comments is enabled).
+    comments: Vec<Comment>,
 }
 
 impl<'a> Parser<'a> {
@@ -101,6 +115,7 @@ impl<'a> Parser<'a> {
             has_buf: false,
             config,
             referenced_params: Vec::new(),
+            comments: Vec::new(),
         }
     }
 
@@ -122,9 +137,22 @@ impl<'a> Parser<'a> {
     fn scan_ignore_whitespace(&mut self) -> (Token, &'a str, usize) {
         loop {
             let (tok, lit, pos) = self.scan();
-            if tok != Token::Whitespace {
-                return (tok, lit, pos);
+            if tok == Token::Whitespace {
+                continue;
             }
+            if tok == Token::Comment {
+                if self.config.preserve_comments {
+                    self.comments.push(Comment {
+                        pos: Position {
+                            start: pos,
+                            end: pos + lit.len(),
+                        },
+                        text: lit.to_string(),
+                    });
+                }
+                continue;
+            }
+            return (tok, lit, pos);
         }
     }
 
@@ -180,7 +208,12 @@ impl<'a> Parser<'a> {
             }
         }
 
-        Ok(ParseResult { expr, functions })
+        let comments = std::mem::take(&mut self.comments);
+        Ok(ParseResult {
+            expr,
+            functions,
+            comments,
+        })
     }
 
     fn parse_function_definitions(
@@ -862,8 +895,17 @@ impl<'a> Parser<'a> {
             Token::ParenLeft => {
                 // Fall through to parse arguments
             }
-            Token::Whitespace => {
-                let (next_tok, _, _) = self.scan();
+            Token::Whitespace | Token::Comment => {
+                if tok == Token::Comment && self.config.preserve_comments {
+                    self.comments.push(Comment {
+                        pos: Position {
+                            start: pos,
+                            end: pos + lit.len(),
+                        },
+                        text: lit.to_string(),
+                    });
+                }
+                let (next_tok, _, _) = self.scan_ignore_whitespace();
                 if next_tok == Token::BracketLeft
                     || next_tok == Token::BraceLeft
                     || is_infix_operator(next_tok)

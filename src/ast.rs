@@ -71,6 +71,7 @@ pub enum Token {
     DoubleColon,
     EqualSign,
     Semicolon,
+    Comment,
 }
 
 impl Token {
@@ -123,6 +124,7 @@ impl Token {
             Token::Pipe => "|",
             Token::Rocket => "=>",
             Token::Semicolon => ";",
+            Token::Comment => "// ...",
         }
     }
 }
@@ -378,12 +380,20 @@ pub struct Slice {
     pub range: Subscript,
 }
 
+/// A comment found in the source query.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Comment {
+    pub pos: Position,
+    pub text: String,
+}
+
 /// The result of parsing a GROQ query, containing both the main expression
 /// and any custom function definitions.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParseResult {
     pub expr: Expr,
     pub functions: Vec<FunctionDefinition>,
+    pub comments: Vec<Comment>,
 }
 
 #[derive(Debug, Clone, PartialEq, Hash, Eq)]
