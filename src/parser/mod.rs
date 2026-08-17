@@ -2,22 +2,55 @@ pub mod operators;
 #[cfg(test)]
 mod tests;
 
-use crate::ast::*;
-use crate::parser::operators::*;
-use crate::tokenizer::Tokenizer;
 use std::collections::HashSet;
 use std::fmt;
 
-#[derive(Debug)]
-pub struct ParseError {
-    pub message: String,
-    pub pos: Position,
+use crate::ast::*;
+use crate::parser::operators::*;
+use crate::tokenizer::Tokenizer;
+
+/// An error encountered while parsing a GROQ query.
+#[derive(Debug, PartialEq)]
+pub enum ParseError {
+    /// The query does not conform to GROQ syntax.
+    Syntax { message: String, pos: Position },
+    /// An expression exceeded [`ParserConfig::max_expression_depth`].
+    ExpressionDepthExceeded {
+        max_depth: usize,
+        depth: usize,
+        pos: Position,
+    },
+}
+
+impl ParseError {
+    fn syntax(message: impl Into<String>, pos: Position) -> Self {
+        Self::Syntax {
+            message: message.into(),
+            pos,
+        }
+    }
+
+    fn is_empty_expression(&self) -> bool {
+        matches!(
+            self,
+            Self::Syntax { message, .. } if message == "EmptyExpression"
+        )
+    }
 }
 
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let result = write!(f, "{} at {:?}", self.message, self.pos);
-        result
+        match self {
+            Self::Syntax { message, pos } => write!(f, "{message} at {pos:?}"),
+            Self::ExpressionDepthExceeded {
+                max_depth,
+                depth,
+                pos,
+            } => write!(
+                f,
+                "expression depth {depth} exceeds configured maximum of {max_depth} at {pos:?}"
+            ),
+        }
     }
 }
 
@@ -38,6 +71,10 @@ pub struct ParserConfig {
     /// Whether to collect comments and include them in the parse result.
     /// Default: false (comments are silently skipped).
     pub preserve_comments: bool,
+
+    /// Maximum number of expression nodes on any root-to-leaf AST path.
+    /// When unset, expression depth is unlimited.
+    pub max_expression_depth: Option<usize>,
 }
 
 impl ParserConfig {
@@ -48,6 +85,7 @@ impl ParserConfig {
             params: HashSet::new(),
             validate_params: true,
             preserve_comments: false,
+            max_expression_depth: None,
         }
     }
 
@@ -57,6 +95,7 @@ impl ParserConfig {
             params: HashSet::new(),
             validate_params: false,
             preserve_comments: false,
+            max_expression_depth: None,
         }
     }
 
@@ -69,6 +108,12 @@ impl ParserConfig {
     /// Enable comment preservation in the parse result.
     pub fn with_comments(mut self) -> Self {
         self.preserve_comments = true;
+        self
+    }
+
+    /// Limit the number of expression nodes on any root-to-leaf AST path.
+    pub fn with_max_expression_depth(mut self, max_expression_depth: usize) -> Self {
+        self.max_expression_depth = Some(max_expression_depth);
         self
     }
 
@@ -85,6 +130,11 @@ impl ParserConfig {
     }
 }
 
+struct Parsed<T> {
+    node: T,
+    depth: usize,
+}
+
 pub struct Parser<'a> {
     tk: Tokenizer<'a>,
     buf_tok: Token,
@@ -96,6 +146,7 @@ pub struct Parser<'a> {
     referenced_params: Vec<(String, Position)>,
     /// Comments collected during parsing (when preserve_comments is enabled).
     comments: Vec<Comment>,
+    expression_parse_depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -116,6 +167,7 @@ impl<'a> Parser<'a> {
             config,
             referenced_params: Vec::new(),
             comments: Vec::new(),
+            expression_parse_depth: 0,
         }
     }
 
@@ -174,13 +226,36 @@ impl<'a> Parser<'a> {
         }
     }
 
-    pub fn parse(&mut self) -> Result<ParseResult, Box<dyn std::error::Error>> {
+    fn ensure_expression_depth(&self, depth: usize, pos: Position) -> Result<(), ParseError> {
+        if let Some(max_expression_depth) = self.config.max_expression_depth
+            && depth > max_expression_depth
+        {
+            return Err(ParseError::ExpressionDepthExceeded {
+                max_depth: max_expression_depth,
+                depth,
+                pos,
+            });
+        }
+        Ok(())
+    }
+
+    fn child_expression_depth<I>(&self, child_depths: I, pos: Position) -> Result<usize, ParseError>
+    where
+        I: IntoIterator<Item = usize>,
+    {
+        let depth = child_depths
+            .into_iter()
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        self.ensure_expression_depth(depth, pos)?;
+        Ok(depth)
+    }
+
+    pub fn parse(&mut self) -> Result<ParseResult, ParseError> {
         let (tok, _, _) = self.scan_ignore_whitespace();
         if tok == Token::EOF {
-            return Err(Box::new(ParseError {
-                message: "no query".to_string(),
-                pos: self.make_pos(0, 0),
-            }));
+            return Err(ParseError::syntax("no query", self.make_pos(0, 0)));
         }
         self.unscan();
 
@@ -190,35 +265,33 @@ impl<'a> Parser<'a> {
 
         let (tok, _, pos) = self.scan_ignore_whitespace();
         if tok != Token::EOF {
-            return Err(Box::new(ParseError {
-                message: "unable to parse entire expression".to_string(),
-                pos: self.make_pos(pos, pos),
-            }));
+            return Err(ParseError::syntax(
+                "unable to parse entire expression",
+                self.make_pos(pos, pos),
+            ));
         }
 
         // Validate parameter references if enabled
         if self.config.validate_params {
             for (param_name, param_pos) in &self.referenced_params {
                 if !self.config.params.contains(param_name) {
-                    return Err(Box::new(ParseError {
-                        message: format!("param ${} referenced, but not provided", param_name),
-                        pos: *param_pos,
-                    }));
+                    return Err(ParseError::syntax(
+                        format!("param ${param_name} referenced, but not provided"),
+                        *param_pos,
+                    ));
                 }
             }
         }
 
         let comments = std::mem::take(&mut self.comments);
         Ok(ParseResult {
-            expr,
+            expr: expr.node,
             functions,
             comments,
         })
     }
 
-    fn parse_function_definitions(
-        &mut self,
-    ) -> Result<Vec<FunctionDefinition>, Box<dyn std::error::Error>> {
+    fn parse_function_definitions(&mut self) -> Result<Vec<FunctionDefinition>, ParseError> {
         let mut functions = Vec::new();
         loop {
             let (tok, lit, _) = self.scan_ignore_whitespace();
@@ -232,45 +305,43 @@ impl<'a> Parser<'a> {
         Ok(functions)
     }
 
-    fn parse_function_definition(
-        &mut self,
-    ) -> Result<FunctionDefinition, Box<dyn std::error::Error>> {
+    fn parse_function_definition(&mut self) -> Result<FunctionDefinition, ParseError> {
         let (namespace, name) = self.parse_function_name()?;
 
         let (tok, _, pos) = self.scan_ignore_whitespace();
         if tok != Token::ParenLeft {
-            return Err(Box::new(ParseError {
-                message: "expected '(' following function name".to_string(),
-                pos: self.make_pos(pos, pos),
-            }));
+            return Err(ParseError::syntax(
+                "expected '(' following function name",
+                self.make_pos(pos, pos),
+            ));
         }
 
         let params = self.parse_function_parameters()?;
 
         let (tok, _, pos) = self.scan_ignore_whitespace();
         if tok != Token::ParenRight {
-            return Err(Box::new(ParseError {
-                message: "expected ')' following function arguments".to_string(),
-                pos: self.make_pos(pos, pos),
-            }));
+            return Err(ParseError::syntax(
+                "expected ')' following function arguments",
+                self.make_pos(pos, pos),
+            ));
         }
 
         let (tok, _, pos) = self.scan_ignore_whitespace();
         if tok != Token::EqualSign {
-            return Err(Box::new(ParseError {
-                message: "expected '=' following ()".to_string(),
-                pos: self.make_pos(pos, pos),
-            }));
+            return Err(ParseError::syntax(
+                "expected '=' following ()",
+                self.make_pos(pos, pos),
+            ));
         }
 
         let body = self.parse_function_body()?;
 
         let (tok, _, pos) = self.scan_ignore_whitespace();
         if tok != Token::Semicolon {
-            return Err(Box::new(ParseError {
-                message: "expected ';' at the end of function definition".to_string(),
-                pos: self.make_pos(pos, pos),
-            }));
+            return Err(ParseError::syntax(
+                "expected ';' at the end of function definition",
+                self.make_pos(pos, pos),
+            ));
         }
 
         Ok(FunctionDefinition {
@@ -281,46 +352,44 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_function_name(&mut self) -> Result<(String, String), Box<dyn std::error::Error>> {
+    fn parse_function_name(&mut self) -> Result<(String, String), ParseError> {
         let (tok, lit, pos) = self.scan_ignore_whitespace();
         if tok != Token::Name {
-            return Err(Box::new(ParseError {
-                message: "expected function namespace".to_string(),
-                pos: self.make_pos(pos, pos),
-            }));
+            return Err(ParseError::syntax(
+                "expected function namespace",
+                self.make_pos(pos, pos),
+            ));
         }
         let namespace = lit.to_string();
 
         let (tok, _, pos) = self.scan_ignore_whitespace();
         if tok != Token::DoubleColon {
-            return Err(Box::new(ParseError {
-                message: "expected '::' followed by a function name".to_string(),
-                pos: self.make_pos(pos, pos),
-            }));
+            return Err(ParseError::syntax(
+                "expected '::' followed by a function name",
+                self.make_pos(pos, pos),
+            ));
         }
 
         let (tok, lit, pos) = self.scan_ignore_whitespace();
         if tok != Token::Name {
-            return Err(Box::new(ParseError {
-                message: "expected a function name".to_string(),
-                pos: self.make_pos(pos, pos),
-            }));
+            return Err(ParseError::syntax(
+                "expected a function name",
+                self.make_pos(pos, pos),
+            ));
         }
         let name = lit.to_string();
 
         Ok((namespace, name))
     }
 
-    fn parse_function_parameters(
-        &mut self,
-    ) -> Result<Vec<FunctionParamDefinition>, Box<dyn std::error::Error>> {
+    fn parse_function_parameters(&mut self) -> Result<Vec<FunctionParamDefinition>, ParseError> {
         let mut params = Vec::new();
         let (tok, lit, pos) = self.scan_ignore_whitespace();
         if tok != Token::Name || !lit.starts_with('$') {
-            return Err(Box::new(ParseError {
-                message: "expected parameter name".to_string(),
-                pos: self.make_pos(pos, pos),
-            }));
+            return Err(ParseError::syntax(
+                "expected parameter name",
+                self.make_pos(pos, pos),
+            ));
         }
 
         params.push(FunctionParamDefinition {
@@ -331,17 +400,17 @@ impl<'a> Parser<'a> {
         Ok(params)
     }
 
-    fn parse_function_body(&mut self) -> Result<Expr, Box<dyn std::error::Error>> {
-        self.parse_general_expression(1, false, false)
+    fn parse_function_body(&mut self) -> Result<Expr, ParseError> {
+        Ok(self.parse_general_expression(1, false, false)?.node)
     }
 
-    fn parse_list(&mut self) -> Result<Vec<Expr>, Box<dyn std::error::Error>> {
+    fn parse_list(&mut self) -> Result<Vec<Parsed<Expr>>, ParseError> {
         let mut exprs = Vec::new();
         loop {
             match self.parse_general_expression(1, false, true) {
                 Ok(expr) => exprs.push(expr),
                 Err(e) => {
-                    if e.to_string() == "EmptyExpression" {
+                    if e.is_empty_expression() {
                         break;
                     }
                     return Err(e);
@@ -362,8 +431,26 @@ impl<'a> Parser<'a> {
         min_precedence: i32,
         immediate_lhs: bool,
         may_be_empty: bool,
-    ) -> Result<Expr, Box<dyn std::error::Error>> {
-        let mut expr: Expr;
+    ) -> Result<Parsed<Expr>, ParseError> {
+        let expression_parse_depth = self.expression_parse_depth.saturating_add(1);
+        self.ensure_expression_depth(
+            expression_parse_depth,
+            self.make_pos(self.buf_pos, self.buf_pos),
+        )?;
+        self.expression_parse_depth = expression_parse_depth;
+        let result =
+            self.parse_general_expression_inner(min_precedence, immediate_lhs, may_be_empty);
+        self.expression_parse_depth -= 1;
+        result
+    }
+
+    fn parse_general_expression_inner(
+        &mut self,
+        min_precedence: i32,
+        immediate_lhs: bool,
+        may_be_empty: bool,
+    ) -> Result<Parsed<Expr>, ParseError> {
+        let mut expr: Parsed<Expr>;
 
         let (tok, lit, pos) = self.scan_ignore_whitespace();
         if is_prefix_operator(tok) {
@@ -377,26 +464,39 @@ impl<'a> Parser<'a> {
             if tok == Token::DotDotDot {
                 match rhs_result {
                     Ok(rhs) => {
-                        expr = Expr::Prefix(PrefixOperator {
-                            pos: self.make_token_pos(pos, lit),
-                            operator: tok,
-                            rhs: Box::new(rhs),
-                        });
+                        let operator_pos = self.make_token_pos(pos, lit);
+                        let depth = self.child_expression_depth([rhs.depth], operator_pos)?;
+                        expr = Parsed {
+                            node: Expr::Prefix(PrefixOperator {
+                                pos: operator_pos,
+                                operator: tok,
+                                rhs: Box::new(rhs.node),
+                            }),
+                            depth,
+                        };
                     }
-                    Err(e) if e.to_string() == "EmptyExpression" => {
-                        expr = Expr::Ellipsis(Ellipsis {
-                            pos: self.make_token_pos(pos, lit),
-                        });
+                    Err(e) if e.is_empty_expression() => {
+                        expr = Parsed {
+                            node: Expr::Ellipsis(Ellipsis {
+                                pos: self.make_token_pos(pos, lit),
+                            }),
+                            depth: 1,
+                        };
                     }
                     Err(e) => return Err(e),
                 }
             } else {
                 let rhs = rhs_result?;
-                expr = Expr::Prefix(PrefixOperator {
-                    pos: self.make_token_pos(pos, lit),
-                    operator: tok,
-                    rhs: Box::new(rhs),
-                });
+                let operator_pos = self.make_token_pos(pos, lit);
+                let depth = self.child_expression_depth([rhs.depth], operator_pos)?;
+                expr = Parsed {
+                    node: Expr::Prefix(PrefixOperator {
+                        pos: operator_pos,
+                        operator: tok,
+                        rhs: Box::new(rhs.node),
+                    }),
+                    depth,
+                };
             }
         } else {
             self.unscan();
@@ -404,7 +504,10 @@ impl<'a> Parser<'a> {
                 expr = e;
             } else {
                 if may_be_empty {
-                    return Err("EmptyExpression".into());
+                    return Err(ParseError::syntax(
+                        "EmptyExpression",
+                        self.make_pos(self.buf_pos, self.buf_pos),
+                    ));
                 }
                 let (a_tok, a_lit, a_pos) = self.scan();
                 let seen = if a_tok == Token::EOF {
@@ -412,10 +515,10 @@ impl<'a> Parser<'a> {
                 } else {
                     format!("token {:?}", a_lit)
                 };
-                return Err(Box::new(ParseError {
-                    message: format!("unexpected {}, expected expression", seen),
-                    pos: self.make_token_pos(a_pos, a_lit),
-                }));
+                return Err(ParseError::syntax(
+                    format!("unexpected {seen}, expected expression"),
+                    self.make_token_pos(a_pos, a_lit),
+                ));
             }
         }
 
@@ -435,47 +538,82 @@ impl<'a> Parser<'a> {
 
                     let rhs = self.parse_chained_bracketed_expression()?;
                     match rhs {
-                        Some(Expr::Attribute(attr)) => {
-                            expr = Expr::Dot(DotOperator {
-                                pos: self.make_token_pos(pos, ident),
-                                lhs: Box::new(expr),
-                                rhs: Box::new(Expr::Attribute(attr)),
-                            });
+                        Some(Parsed {
+                            node: Expr::Attribute(attr),
+                            depth: rhs_depth,
+                        }) => {
+                            let operator_pos = self.make_token_pos(pos, ident);
+                            let depth =
+                                self.child_expression_depth([expr.depth, rhs_depth], operator_pos)?;
+                            expr = Parsed {
+                                node: Expr::Dot(DotOperator {
+                                    pos: operator_pos,
+                                    lhs: Box::new(expr.node),
+                                    rhs: Box::new(Expr::Attribute(attr)),
+                                }),
+                                depth,
+                            };
                             continue;
                         }
-                        Some(Expr::Subscript(sub)) => {
+                        Some(Parsed {
+                            node: Expr::Subscript(sub),
+                            depth: rhs_depth,
+                        }) => {
+                            let depth = expr.depth.saturating_add(1).max(rhs_depth);
+                            self.ensure_expression_depth(depth, sub.pos)?;
                             if let Expr::Range(range) = *sub.value {
                                 let p = sub.pos;
-                                expr = Expr::Slice(Slice {
-                                    pos: p,
-                                    lhs: Box::new(expr),
-                                    range: Subscript {
+                                expr = Parsed {
+                                    node: Expr::Slice(Slice {
                                         pos: p,
-                                        value: Box::new(Expr::Range(range)),
-                                    },
-                                });
+                                        lhs: Box::new(expr.node),
+                                        range: Subscript {
+                                            pos: p,
+                                            value: Box::new(Expr::Range(range)),
+                                        },
+                                    }),
+                                    depth,
+                                };
                             } else {
-                                expr = Expr::Element(Element {
-                                    pos: sub.pos,
-                                    lhs: Box::new(expr),
-                                    idx: sub,
-                                });
+                                expr = Parsed {
+                                    node: Expr::Element(Element {
+                                        pos: sub.pos,
+                                        lhs: Box::new(expr.node),
+                                        idx: sub,
+                                    }),
+                                    depth,
+                                };
                             }
                             continue;
                         }
-                        Some(Expr::Constraint(cons)) => {
-                            expr = Expr::Filter(Filter {
-                                pos: cons.pos,
-                                lhs: Box::new(expr),
-                                constraint: cons,
-                            });
+                        Some(Parsed {
+                            node: Expr::Constraint(cons),
+                            depth: rhs_depth,
+                        }) => {
+                            let depth = expr.depth.saturating_add(1).max(rhs_depth);
+                            self.ensure_expression_depth(depth, cons.pos)?;
+                            expr = Parsed {
+                                node: Expr::Filter(Filter {
+                                    pos: cons.pos,
+                                    lhs: Box::new(expr.node),
+                                    constraint: cons,
+                                }),
+                                depth,
+                            };
                             continue;
                         }
-                        Some(Expr::ArrayTraversal(at)) => {
-                            expr = Expr::ArrayTraversal(ArrayTraversal {
-                                pos: at.pos,
-                                expr: Box::new(expr),
-                            });
+                        Some(Parsed {
+                            node: Expr::ArrayTraversal(at),
+                            ..
+                        }) => {
+                            let depth = self.child_expression_depth([expr.depth], at.pos)?;
+                            expr = Parsed {
+                                node: Expr::ArrayTraversal(ArrayTraversal {
+                                    pos: at.pos,
+                                    expr: Box::new(expr.node),
+                                }),
+                                depth,
+                            };
                             continue;
                         }
                         _ => {
@@ -483,7 +621,7 @@ impl<'a> Parser<'a> {
                             break;
                         }
                     }
-                } else if let Expr::Postfix(ref p) = expr {
+                } else if let Expr::Postfix(ref p) = expr.node {
                     if p.operator == Token::Arrow && tok == Token::Name {
                         operator = Token::Dot;
                     } else {
@@ -503,11 +641,16 @@ impl<'a> Parser<'a> {
             }
 
             if is_postfix_operator(tok) {
-                expr = Expr::Postfix(PostfixOperator {
-                    pos: self.make_token_pos(pos, ident),
-                    lhs: Box::new(expr),
-                    operator: tok,
-                });
+                let operator_pos = self.make_token_pos(pos, ident);
+                let depth = self.child_expression_depth([expr.depth], operator_pos)?;
+                expr = Parsed {
+                    node: Expr::Postfix(PostfixOperator {
+                        pos: operator_pos,
+                        lhs: Box::new(expr.node),
+                        operator: tok,
+                    }),
+                    depth,
+                };
                 continue;
             }
 
@@ -521,46 +664,78 @@ impl<'a> Parser<'a> {
 
             match operator {
                 Token::Dot => {
-                    expr = Expr::Dot(DotOperator {
-                        pos: self.make_token_pos(pos, ident),
-                        lhs: Box::new(expr),
-                        rhs: Box::new(rhs),
-                    });
+                    let operator_pos = self.make_token_pos(pos, ident);
+                    let depth =
+                        self.child_expression_depth([expr.depth, rhs.depth], operator_pos)?;
+                    expr = Parsed {
+                        node: Expr::Dot(DotOperator {
+                            pos: operator_pos,
+                            lhs: Box::new(expr.node),
+                            rhs: Box::new(rhs.node),
+                        }),
+                        depth,
+                    };
                 }
-                Token::Pipe => match rhs {
+                Token::Pipe => match rhs.node {
                     Expr::Object(obj) => {
-                        expr = Expr::Projection(Projection {
-                            pos: self.make_token_pos(pos, ident),
-                            lhs: Box::new(expr),
-                            object: obj,
-                        });
+                        let operator_pos = self.make_token_pos(pos, ident);
+                        let depth = expr.depth.saturating_add(1).max(rhs.depth);
+                        self.ensure_expression_depth(depth, operator_pos)?;
+                        expr = Parsed {
+                            node: Expr::Projection(Projection {
+                                pos: operator_pos,
+                                lhs: Box::new(expr.node),
+                                object: obj,
+                            }),
+                            depth,
+                        };
                     }
                     Expr::FunctionCall(func) => {
-                        expr = Expr::FunctionPipe(FunctionPipe {
-                            pos: self.make_token_pos(pos, ident),
-                            lhs: Box::new(expr),
-                            func,
-                        });
+                        let operator_pos = self.make_token_pos(pos, ident);
+                        let depth = expr.depth.saturating_add(1).max(rhs.depth);
+                        self.ensure_expression_depth(depth, operator_pos)?;
+                        expr = Parsed {
+                            node: Expr::FunctionPipe(FunctionPipe {
+                                pos: operator_pos,
+                                lhs: Box::new(expr.node),
+                                func,
+                            }),
+                            depth,
+                        };
                     }
-                    _ => return Err("object or function expected after pipe".into()),
+                    _ => {
+                        return Err(ParseError::syntax(
+                            "object or function expected after pipe",
+                            self.make_token_pos(pos, ident),
+                        ));
+                    }
                 },
                 _ => {
+                    let operator_pos = self.make_token_pos(pos, ident);
+                    let depth =
+                        self.child_expression_depth([expr.depth, rhs.depth], operator_pos)?;
                     let bin_op = BinaryOperator {
-                        pos: self.make_token_pos(pos, ident),
+                        pos: operator_pos,
                         operator,
-                        lhs: Box::new(expr),
-                        rhs: Box::new(rhs),
+                        lhs: Box::new(expr.node),
+                        rhs: Box::new(rhs.node),
                     };
 
                     if operator == Token::DotDot || operator == Token::DotDotDot {
-                        expr = Expr::Range(Range {
-                            pos: bin_op.pos,
-                            start: bin_op.lhs,
-                            end: bin_op.rhs,
-                            inclusive: operator == Token::DotDot,
-                        });
+                        expr = Parsed {
+                            node: Expr::Range(Range {
+                                pos: bin_op.pos,
+                                start: bin_op.lhs,
+                                end: bin_op.rhs,
+                                inclusive: operator == Token::DotDot,
+                            }),
+                            depth,
+                        };
                     } else {
-                        expr = Expr::Binary(bin_op);
+                        expr = Parsed {
+                            node: Expr::Binary(bin_op),
+                            depth,
+                        };
                     }
                 }
             }
@@ -569,9 +744,7 @@ impl<'a> Parser<'a> {
         Ok(expr)
     }
 
-    fn parse_chained_bracketed_expression(
-        &mut self,
-    ) -> Result<Option<Expr>, Box<dyn std::error::Error>> {
+    fn parse_chained_bracketed_expression(&mut self) -> Result<Option<Parsed<Expr>>, ParseError> {
         let (tok, _, pos_start) = self.scan_ignore_whitespace();
         if tok != Token::BracketLeft {
             return Ok(None);
@@ -581,7 +754,7 @@ impl<'a> Parser<'a> {
         let expr = match expr_result {
             Ok(e) => Some(e),
             Err(e) => {
-                if e.to_string() == "EmptyExpression" {
+                if e.is_empty_expression() {
                     None
                 } else {
                     return Err(e);
@@ -593,59 +766,79 @@ impl<'a> Parser<'a> {
         let range_end = pos_end + lit_end.len();
 
         if tok_end != Token::BracketRight {
-            return Err(Box::new(ParseError {
-                message: "expected ']' following expression".to_string(),
-                pos: self.make_pos(pos_start, range_end),
-            }));
+            return Err(ParseError::syntax(
+                "expected ']' following expression",
+                self.make_pos(pos_start, range_end),
+            ));
         }
 
         if expr.is_none() {
-            return Ok(Some(Expr::ArrayTraversal(ArrayTraversal {
-                pos: self.make_pos(pos_start, range_end),
-                expr: Box::new(Expr::Everything(Everything {
-                    pos: self.make_pos(0, 0),
-                })),
-            })));
+            let expression_pos = self.make_pos(pos_start, range_end);
+            let depth = self.child_expression_depth([1], expression_pos)?;
+            return Ok(Some(Parsed {
+                node: Expr::ArrayTraversal(ArrayTraversal {
+                    pos: expression_pos,
+                    expr: Box::new(Expr::Everything(Everything {
+                        pos: self.make_pos(0, 0),
+                    })),
+                }),
+                depth,
+            }));
         }
         let expr = expr.unwrap();
 
-        if let Expr::Literal(Literal::String(s)) = &expr {
-            return Ok(Some(Expr::Attribute(Attribute {
-                pos: self.make_pos(pos_start, range_end),
-                name: s.value.clone(),
-            })));
-        }
-
-        if let Expr::Range(_) = &expr {
-            if !expr.is_subscript_expression() {
-                return Err(Box::new(ParseError {
-                    message: "subscript ranges must have integer endpoints".to_string(),
+        if let Expr::Literal(Literal::String(s)) = &expr.node {
+            return Ok(Some(Parsed {
+                node: Expr::Attribute(Attribute {
                     pos: self.make_pos(pos_start, range_end),
-                }));
+                    name: s.value.clone(),
+                }),
+                depth: 1,
+            }));
+        }
+
+        if let Expr::Range(_) = &expr.node {
+            if !expr.node.is_subscript_expression() {
+                return Err(ParseError::syntax(
+                    "subscript ranges must have integer endpoints",
+                    self.make_pos(pos_start, range_end),
+                ));
             }
-            return Ok(Some(Expr::Subscript(Subscript {
-                pos: self.make_pos(pos_start, range_end),
-                value: Box::new(expr),
-            })));
+            let expression_pos = self.make_pos(pos_start, range_end);
+            let depth = self.child_expression_depth([expr.depth], expression_pos)?;
+            return Ok(Some(Parsed {
+                node: Expr::Subscript(Subscript {
+                    pos: expression_pos,
+                    value: Box::new(expr.node),
+                }),
+                depth,
+            }));
         }
 
-        if expr.is_subscript_expression() {
-            return Ok(Some(Expr::Subscript(Subscript {
-                pos: self.make_pos(pos_start, range_end),
-                value: Box::new(expr),
-            })));
+        if expr.node.is_subscript_expression() {
+            let expression_pos = self.make_pos(pos_start, range_end);
+            let depth = self.child_expression_depth([expr.depth], expression_pos)?;
+            return Ok(Some(Parsed {
+                node: Expr::Subscript(Subscript {
+                    pos: expression_pos,
+                    value: Box::new(expr.node),
+                }),
+                depth,
+            }));
         }
 
-        Ok(Some(Expr::Constraint(Constraint {
-            pos: self.make_pos(pos_start, range_end),
-            expression: Box::new(expr),
-        })))
+        let expression_pos = self.make_pos(pos_start, range_end);
+        let depth = self.child_expression_depth([expr.depth], expression_pos)?;
+        Ok(Some(Parsed {
+            node: Expr::Constraint(Constraint {
+                pos: expression_pos,
+                expression: Box::new(expr.node),
+            }),
+            depth,
+        }))
     }
 
-    fn parse_atom(
-        &mut self,
-        immediate_lhs: bool,
-    ) -> Result<Option<Expr>, Box<dyn std::error::Error>> {
+    fn parse_atom(&mut self, immediate_lhs: bool) -> Result<Option<Parsed<Expr>>, ParseError> {
         let (tok, lit, pos) = self.scan_ignore_whitespace();
         match tok {
             Token::Name => {
@@ -654,71 +847,120 @@ impl<'a> Parser<'a> {
                     // Track this parameter reference for validation
                     self.referenced_params
                         .push((stripped.to_string(), param_pos));
-                    return Ok(Some(Expr::Param(Param {
-                        pos: param_pos,
-                        name: stripped.to_string(),
-                    })));
+                    return Ok(Some(Parsed {
+                        node: Expr::Param(Param {
+                            pos: param_pos,
+                            name: stripped.to_string(),
+                        }),
+                        depth: 1,
+                    }));
                 }
 
                 if let Some(func) = self.parse_function_expression(tok, lit, pos)? {
-                    return Ok(Some(Expr::FunctionCall(func)));
+                    return Ok(Some(Parsed {
+                        node: Expr::FunctionCall(func.node),
+                        depth: func.depth,
+                    }));
                 }
 
-                Ok(Some(Expr::Attribute(Attribute {
-                    pos: self.make_token_pos(pos, lit),
-                    name: lit.to_string(),
-                })))
+                Ok(Some(Parsed {
+                    node: Expr::Attribute(Attribute {
+                        pos: self.make_token_pos(pos, lit),
+                        name: lit.to_string(),
+                    }),
+                    depth: 1,
+                }))
             }
-            Token::Asterisk => Ok(Some(Expr::Everything(Everything {
-                pos: self.make_token_pos(pos, lit),
-            }))),
-            Token::At => Ok(Some(Expr::This(This {
-                pos: self.make_token_pos(pos, lit),
-            }))),
-            Token::Hat => Ok(Some(Expr::Parent(Parent {
-                pos: self.make_token_pos(pos, lit),
-            }))),
-            Token::AscOperator | Token::DescOperator | Token::InOperator | Token::MatchOperator => {
-                Ok(Some(Expr::Attribute(Attribute {
+            Token::Asterisk => Ok(Some(Parsed {
+                node: Expr::Everything(Everything {
                     pos: self.make_token_pos(pos, lit),
-                    name: lit.to_string(),
-                })))
+                }),
+                depth: 1,
+            })),
+            Token::At => Ok(Some(Parsed {
+                node: Expr::This(This {
+                    pos: self.make_token_pos(pos, lit),
+                }),
+                depth: 1,
+            })),
+            Token::Hat => Ok(Some(Parsed {
+                node: Expr::Parent(Parent {
+                    pos: self.make_token_pos(pos, lit),
+                }),
+                depth: 1,
+            })),
+            Token::AscOperator | Token::DescOperator | Token::InOperator | Token::MatchOperator => {
+                Ok(Some(Parsed {
+                    node: Expr::Attribute(Attribute {
+                        pos: self.make_token_pos(pos, lit),
+                        name: lit.to_string(),
+                    }),
+                    depth: 1,
+                }))
             }
             Token::Integer => {
                 // Try parsing as i64 first, fall back to f64 for large numbers
                 if let Ok(value) = lit.parse::<i64>() {
-                    Ok(Some(Expr::Literal(Literal::Integer(IntegerLiteral {
-                        pos: self.make_token_pos(pos, lit),
-                        value,
-                    }))))
+                    Ok(Some(Parsed {
+                        node: Expr::Literal(Literal::Integer(IntegerLiteral {
+                            pos: self.make_token_pos(pos, lit),
+                            value,
+                        })),
+                        depth: 1,
+                    }))
                 } else {
                     // Integer too large for i64, parse as float
-                    Ok(Some(Expr::Literal(Literal::Float(FloatLiteral {
-                        pos: self.make_token_pos(pos, lit),
-                        value: lit.parse()?,
-                    }))))
+                    Ok(Some(Parsed {
+                        node: Expr::Literal(Literal::Float(FloatLiteral {
+                            pos: self.make_token_pos(pos, lit),
+                            value: lit.parse::<f64>().map_err(|error| {
+                                ParseError::syntax(
+                                    format!("invalid number: {error}"),
+                                    self.make_token_pos(pos, lit),
+                                )
+                            })?,
+                        })),
+                        depth: 1,
+                    }))
                 }
             }
-            Token::Float => Ok(Some(Expr::Literal(Literal::Float(FloatLiteral {
-                pos: self.make_token_pos(pos, lit),
-                value: lit.parse()?,
-            })))),
+            Token::Float => Ok(Some(Parsed {
+                node: Expr::Literal(Literal::Float(FloatLiteral {
+                    pos: self.make_token_pos(pos, lit),
+                    value: lit.parse::<f64>().map_err(|error| {
+                        ParseError::syntax(
+                            format!("invalid number: {error}"),
+                            self.make_token_pos(pos, lit),
+                        )
+                    })?,
+                })),
+                depth: 1,
+            })),
             Token::String => {
                 // Parse the string value, handling escape sequences
                 let inner = &lit[1..lit.len() - 1];
-                let value = unescape_string(inner)?;
-                Ok(Some(Expr::Literal(Literal::String(StringLiteral {
-                    pos: self.make_token_pos(pos, lit),
-                    value,
-                }))))
+                let value = unescape_string(inner);
+                Ok(Some(Parsed {
+                    node: Expr::Literal(Literal::String(StringLiteral {
+                        pos: self.make_token_pos(pos, lit),
+                        value,
+                    })),
+                    depth: 1,
+                }))
             }
-            Token::Bool => Ok(Some(Expr::Literal(Literal::Boolean(BooleanLiteral {
-                pos: self.make_token_pos(pos, lit),
-                value: lit == "true",
-            })))),
-            Token::Null => Ok(Some(Expr::Literal(Literal::Null(NullLiteral {
-                pos: self.make_token_pos(pos, lit),
-            })))),
+            Token::Bool => Ok(Some(Parsed {
+                node: Expr::Literal(Literal::Boolean(BooleanLiteral {
+                    pos: self.make_token_pos(pos, lit),
+                    value: lit == "true",
+                })),
+                depth: 1,
+            })),
+            Token::Null => Ok(Some(Parsed {
+                node: Expr::Literal(Literal::Null(NullLiteral {
+                    pos: self.make_token_pos(pos, lit),
+                })),
+                depth: 1,
+            })),
             Token::ParenLeft => {
                 let expr = self.parse_parenthesis_expr(pos, lit)?;
                 Ok(Some(expr))
@@ -749,7 +991,7 @@ impl<'a> Parser<'a> {
         &mut self,
         pos: usize,
         lit: &str,
-    ) -> Result<Expr, Box<dyn std::error::Error>> {
+    ) -> Result<Parsed<Expr>, ParseError> {
         let expr = self.parse_general_expression(1, false, false)?;
         let (tok, _, tok_pos) = self.scan_ignore_whitespace();
 
@@ -765,35 +1007,54 @@ impl<'a> Parser<'a> {
             }
 
             if current_tok != Token::ParenRight {
-                return Err(Box::new(ParseError {
-                    message: "expected ')' following parenthesized expression".to_string(),
-                    pos: self.make_pos(pos, tok_pos),
-                }));
+                return Err(ParseError::syntax(
+                    "expected ')' following parenthesized expression",
+                    self.make_pos(pos, tok_pos),
+                ));
             }
 
-            return Ok(Expr::Tuple(Tuple {
-                pos: self.make_token_pos(pos, lit),
-                members: tuple_members,
-            }));
+            let expression_pos = self.make_token_pos(pos, lit);
+            let depth = self.child_expression_depth(
+                tuple_members.iter().map(|member| member.depth),
+                expression_pos,
+            )?;
+            return Ok(Parsed {
+                node: Expr::Tuple(Tuple {
+                    pos: expression_pos,
+                    members: tuple_members
+                        .into_iter()
+                        .map(|member| member.node)
+                        .collect(),
+                }),
+                depth,
+            });
         }
 
         if tok != Token::ParenRight {
-            return Err(Box::new(ParseError {
-                message: "expected ')' following parenthesized expression".to_string(),
-                pos: self.make_pos(pos, tok_pos),
-            }));
+            return Err(ParseError::syntax(
+                "expected ')' following parenthesized expression",
+                self.make_pos(pos, tok_pos),
+            ));
         }
 
-        Ok(Expr::Group(Group {
-            pos: self.make_token_pos(pos, lit),
-            expression: Box::new(expr),
-        }))
+        let expression_pos = self.make_token_pos(pos, lit);
+        let depth = self.child_expression_depth([expr.depth], expression_pos)?;
+        Ok(Parsed {
+            node: Expr::Group(Group {
+                pos: expression_pos,
+                expression: Box::new(expr.node),
+            }),
+            depth,
+        })
     }
 
-    fn parse_array_expression(&mut self) -> Result<Expr, Box<dyn std::error::Error>> {
+    fn parse_array_expression(&mut self) -> Result<Parsed<Expr>, ParseError> {
         let (tok, _, pos_start) = self.scan_ignore_whitespace();
         if tok != Token::BracketLeft {
-            return Err("Expected '['".into());
+            return Err(ParseError::syntax(
+                "expected '['",
+                self.make_pos(pos_start, pos_start),
+            ));
         }
 
         let (peek_tok, _, _) = self.scan_ignore_whitespace();
@@ -810,22 +1071,36 @@ impl<'a> Parser<'a> {
         let range_end = pos_end + lit_end.len();
 
         if tok_end != Token::BracketRight {
-            return Err(Box::new(ParseError {
-                message: "expected ']' following array body".to_string(),
-                pos: self.make_pos(pos_start, range_end),
-            }));
+            return Err(ParseError::syntax(
+                "expected ']' following array body",
+                self.make_pos(pos_start, range_end),
+            ));
         }
 
-        Ok(Expr::Array(Array {
-            pos: self.make_pos(pos_start, range_end),
-            expressions: exprs,
-        }))
+        let expression_pos = self.make_pos(pos_start, range_end);
+        let depth = self.child_expression_depth(
+            exprs.iter().map(|expression| expression.depth),
+            expression_pos,
+        )?;
+        Ok(Parsed {
+            node: Expr::Array(Array {
+                pos: expression_pos,
+                expressions: exprs
+                    .into_iter()
+                    .map(|expression| expression.node)
+                    .collect(),
+            }),
+            depth,
+        })
     }
 
-    fn parse_object_expression(&mut self) -> Result<Expr, Box<dyn std::error::Error>> {
+    fn parse_object_expression(&mut self) -> Result<Parsed<Expr>, ParseError> {
         let (tok, _, pos_start) = self.scan_ignore_whitespace();
         if tok != Token::BraceLeft {
-            return Err("Expected '{'".into());
+            return Err(ParseError::syntax(
+                "expected '{'",
+                self.make_pos(pos_start, pos_start),
+            ));
         }
 
         let mut exprs = Vec::new();
@@ -842,16 +1117,27 @@ impl<'a> Parser<'a> {
         let range_end = pos_end + lit_end.len();
 
         if tok_end != Token::BraceRight {
-            return Err(Box::new(ParseError {
-                message: "expected '}' following object body".to_string(),
-                pos: self.make_pos(pos_start, range_end),
-            }));
+            return Err(ParseError::syntax(
+                "expected '}' following object body",
+                self.make_pos(pos_start, range_end),
+            ));
         }
 
-        Ok(Expr::Object(Object {
-            pos: self.make_pos(pos_start, range_end),
-            expressions: exprs,
-        }))
+        let expression_pos = self.make_pos(pos_start, range_end);
+        let depth = self.child_expression_depth(
+            exprs.iter().map(|expression| expression.depth),
+            expression_pos,
+        )?;
+        Ok(Parsed {
+            node: Expr::Object(Object {
+                pos: expression_pos,
+                expressions: exprs
+                    .into_iter()
+                    .map(|expression| expression.node)
+                    .collect(),
+            }),
+            depth,
+        })
     }
 
     fn parse_function_expression(
@@ -859,37 +1145,37 @@ impl<'a> Parser<'a> {
         name_token: Token,
         name: &'a str,
         name_pos: usize,
-    ) -> Result<Option<FunctionCall>, Box<dyn std::error::Error>> {
+    ) -> Result<Option<Parsed<FunctionCall>>, ParseError> {
         let (tok, lit, pos) = self.scan();
 
         match tok {
             Token::DoubleColon => {
                 if name_token != Token::Name {
-                    return Err(Box::new(ParseError {
-                        message: "expected valid namespace identifier before '::'".to_string(),
-                        pos: self.make_token_pos(pos, lit),
-                    }));
+                    return Err(ParseError::syntax(
+                        "expected valid namespace identifier before '::'",
+                        self.make_token_pos(pos, lit),
+                    ));
                 }
 
                 let (f_tok, f_lit, f_pos) = self.scan_ignore_whitespace();
                 if f_tok != Token::Name {
-                    return Err(Box::new(ParseError {
-                        message: "expected a function following namespace expression".to_string(),
-                        pos: self.make_token_pos(f_pos, f_lit),
-                    }));
+                    return Err(ParseError::syntax(
+                        "expected a function following namespace expression",
+                        self.make_token_pos(f_pos, f_lit),
+                    ));
                 }
 
                 let func_opt = self.parse_function_expression(Token::DoubleColon, f_lit, f_pos)?;
 
                 return if let Some(mut func) = func_opt {
-                    func.namespace = name.to_string();
-                    func.pos.start = name_pos;
+                    func.node.namespace = name.to_string();
+                    func.node.pos.start = name_pos;
                     Ok(Some(func))
                 } else {
-                    Err(Box::new(ParseError {
-                        message: "expected a function following namespace expression".to_string(),
-                        pos: self.make_token_pos(f_pos, f_lit),
-                    }))
+                    Err(ParseError::syntax(
+                        "expected a function following namespace expression",
+                        self.make_token_pos(f_pos, f_lit),
+                    ))
                 };
             }
             Token::ParenLeft => {
@@ -941,22 +1227,33 @@ impl<'a> Parser<'a> {
         let (tok_end, lit_end, pos_end) = self.scan_ignore_whitespace();
         let range_end = pos_end + lit_end.len();
         if tok_end != Token::ParenRight {
-            return Err(Box::new(ParseError {
-                message: "expected ')' following function arguments".to_string(),
-                pos: self.make_pos(pos, range_end),
-            }));
+            return Err(ParseError::syntax(
+                "expected ')' following function arguments",
+                self.make_pos(pos, range_end),
+            ));
         }
 
-        Ok(Some(FunctionCall {
-            namespace: String::new(),
-            pos: self.make_token_pos(name_pos, name),
-            name: name.to_string(),
-            arguments: exprs,
+        let expression_pos = self.make_token_pos(name_pos, name);
+        let depth = self.child_expression_depth(
+            exprs.iter().map(|expression| expression.depth),
+            expression_pos,
+        )?;
+        Ok(Some(Parsed {
+            node: FunctionCall {
+                namespace: String::new(),
+                pos: expression_pos,
+                name: name.to_string(),
+                arguments: exprs
+                    .into_iter()
+                    .map(|expression| expression.node)
+                    .collect(),
+            },
+            depth,
         }))
     }
 }
 
-fn unescape_string(s: &str) -> Result<String, Box<dyn std::error::Error>> {
+fn unescape_string(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
 
@@ -1037,5 +1334,5 @@ fn unescape_string(s: &str) -> Result<String, Box<dyn std::error::Error>> {
         }
     }
 
-    Ok(result)
+    result
 }

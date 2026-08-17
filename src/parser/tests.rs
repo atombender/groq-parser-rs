@@ -1,5 +1,5 @@
 use crate::ast::*;
-use crate::parser::Parser;
+use crate::parser::{ParseError, Parser, ParserConfig};
 
 // Helper to parse and unwrap
 fn parse(src: &str) -> Expr {
@@ -14,6 +14,13 @@ fn parse(src: &str) -> Expr {
 fn assert_parses(src: &str) {
     let mut parser = Parser::new(src);
     assert!(parser.parse().is_ok(), "Failed to parse: {}", src);
+}
+
+fn parser_with_max_expression_depth(src: &str, max_expression_depth: usize) -> Parser<'_> {
+    Parser::new_with_config(
+        src,
+        ParserConfig::without_param_validation().with_max_expression_depth(max_expression_depth),
+    )
 }
 
 // ==================== LITERALS ====================
@@ -177,6 +184,57 @@ fn test_logical_operators() {
     assert_parses("a || b || c");
     assert_parses("a && b || c");
     assert_parses("(a && b) || (c && d)");
+}
+
+#[test]
+fn test_max_expression_depth_allows_left_associative_chain_at_limit() {
+    let mut parser = parser_with_max_expression_depth("a || b || c", 3);
+    assert!(parser.parse().is_ok());
+}
+
+#[test]
+fn test_max_expression_depth_rejects_left_associative_chain_beyond_limit() {
+    let mut parser = parser_with_max_expression_depth("a || b || c || d", 3);
+    let error = parser.parse().unwrap_err();
+
+    assert!(matches!(
+        error,
+        ParseError::ExpressionDepthExceeded {
+            max_depth: 3,
+            depth: 4,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn test_max_expression_depth_rejects_long_or_chain_on_small_stack() {
+    // This limit keeps the parser comfortably within the deliberately small test stack.
+    const MAX_EXPRESSION_DEPTH: usize = 64;
+    // This size reproduces the production shape without making the test unnecessarily slow.
+    const OPERAND_COUNT: usize = 4_400;
+
+    let query = std::iter::repeat_n("a", OPERAND_COUNT)
+        .collect::<Vec<_>>()
+        .join(" || ");
+
+    std::thread::Builder::new()
+        .stack_size(512 * 1024)
+        .spawn(move || {
+            let mut parser = parser_with_max_expression_depth(&query, MAX_EXPRESSION_DEPTH);
+            let error = parser.parse().unwrap_err();
+            assert!(matches!(
+                error,
+                ParseError::ExpressionDepthExceeded {
+                    max_depth: MAX_EXPRESSION_DEPTH,
+                    depth: 65,
+                    ..
+                }
+            ));
+        })
+        .unwrap()
+        .join()
+        .unwrap();
 }
 
 #[test]
@@ -431,6 +489,34 @@ fn test_grouping() {
     assert_parses("a * (b + c)");
     assert_parses("((a))");
     assert_parses("((a + b))");
+}
+
+#[test]
+fn test_max_expression_depth_rejects_nested_groups_before_stack_overflow() {
+    // This limit keeps the parser comfortably within the deliberately small test stack.
+    const MAX_EXPRESSION_DEPTH: usize = 16;
+    // This size reproduces the production shape without making the test unnecessarily slow.
+    const GROUP_COUNT: usize = 4_400;
+
+    let query = format!("{}a{}", "(".repeat(GROUP_COUNT), ")".repeat(GROUP_COUNT));
+
+    std::thread::Builder::new()
+        .stack_size(512 * 1024)
+        .spawn(move || {
+            let mut parser = parser_with_max_expression_depth(&query, MAX_EXPRESSION_DEPTH);
+            let error = parser.parse().unwrap_err();
+            assert!(matches!(
+                error,
+                ParseError::ExpressionDepthExceeded {
+                    max_depth: MAX_EXPRESSION_DEPTH,
+                    depth: 17,
+                    ..
+                }
+            ));
+        })
+        .unwrap()
+        .join()
+        .unwrap();
 }
 
 // ==================== TUPLES ====================
