@@ -973,6 +973,15 @@ fn test_error_trailing_content() {
 }
 
 #[test]
+fn test_error_projection_after_dot() {
+    assert_parse_fails("*[_type == \"author\"].{name}");
+    assert_parse_fails("a.b.{c}");
+
+    let mut parser = Parser::new("*[_type == \"author\"]{name} | {name}");
+    assert!(parser.parse().is_ok());
+}
+
+#[test]
 fn test_error_function_definition_missing_paren() {
     assert_parse_fails("fn ns::func = $a; *");
 }

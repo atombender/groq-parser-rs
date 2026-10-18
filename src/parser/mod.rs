@@ -665,6 +665,14 @@ impl<'a> Parser<'a> {
             match operator {
                 Token::Dot => {
                     let operator_pos = self.make_token_pos(pos, ident);
+                    // A projection follows its operand directly or after `|`,
+                    // never after `.`.
+                    if matches!(rhs.node, Expr::Object(_)) {
+                        return Err(ParseError::syntax(
+                            "expected an attribute name following '.'",
+                            operator_pos,
+                        ));
+                    }
                     let depth =
                         self.child_expression_depth([expr.depth, rhs.depth], operator_pos)?;
                     expr = Parsed {
