@@ -23,6 +23,40 @@ fn parser_with_max_expression_depth(src: &str, max_expression_depth: usize) -> P
     )
 }
 
+// Helper to parse and return the referenced params, checking that each span
+// covers the `$name` token and that they are in source order
+fn referenced_params(src: &str) -> Vec<Param> {
+    let mut parser = Parser::new(src);
+    let result = parser
+        .parse()
+        .unwrap_or_else(|err| panic!("Failed to parse '{src}': {err}"));
+    let params: Vec<Param> = result.referenced_params().into_iter().cloned().collect();
+    let mut previous_end = 0;
+    for param in &params {
+        assert!(
+            param.pos.start >= previous_end && param.pos.end <= src.len(),
+            "param ${} has an out-of-order span {:?} in {src}",
+            param.name,
+            param.pos
+        );
+        assert_eq!(
+            &src[param.pos.start..param.pos.end],
+            format!("${}", param.name),
+            "span does not cover ${} in {src}",
+            param.name
+        );
+        previous_end = param.pos.end;
+    }
+    params
+}
+
+fn param_names(src: &str) -> Vec<String> {
+    referenced_params(src)
+        .into_iter()
+        .map(|param| param.name)
+        .collect()
+}
+
 // ==================== LITERALS ====================
 
 #[test]
@@ -565,6 +599,228 @@ fn test_parse_no_functions() {
     let mut parser = Parser::new("*[_type == \"movie\"]");
     let result = parser.parse().unwrap();
     assert_eq!(result.functions.len(), 0);
+}
+
+// ==================== REFERENCED PARAMS ====================
+
+#[test]
+fn test_referenced_params_absent() {
+    assert!(param_names("*").is_empty());
+    assert!(param_names("{title, author}").is_empty());
+    assert!(param_names(r#"*[_type == "movie"]"#).is_empty());
+    assert!(param_names(r#"*[_type == "$notAParam"]"#).is_empty());
+    assert!(param_names("// $notAParam\n*").is_empty());
+    // A custom-function parameter is a binding, not a query parameter.
+    assert!(param_names("fn math::identity($n) = $n; *").is_empty());
+    assert!(param_names("fn math::identity($n) = 1; *").is_empty());
+}
+
+#[test]
+fn test_referenced_param_span_is_byte_range_of_token() {
+    let src = "*[_type == $type]";
+    let params = referenced_params(src);
+    assert_eq!(params.len(), 1);
+    assert_eq!(params[0].name, "type");
+    assert_eq!(params[0].pos, Position { start: 11, end: 16 });
+
+    // `é` is two bytes; the span is still a byte range into the source.
+    let src = "*[_type == \"é\" && x == $id]";
+    let params = referenced_params(src);
+    assert_eq!(params.len(), 1);
+    assert_eq!(params[0].name, "id");
+    assert_eq!(params[0].pos, Position { start: 24, end: 27 });
+    assert_eq!(&src[params[0].pos.start..params[0].pos.end], "$id");
+}
+
+#[test]
+fn test_referenced_params_cover_every_use_site() {
+    assert_eq!(
+        param_names("*[_type == $type && _id == $id]"),
+        ["type", "id"]
+    );
+    assert_eq!(
+        param_names(r#"*{"label": $label, "n": count($items)}"#),
+        ["label", "items"]
+    );
+    assert_eq!(param_names("items[$idx]"), ["idx"]);
+    assert_eq!(param_names("items[$start..$end]"), ["start", "end"]);
+    assert_eq!(param_names("items[$start...$end]"), ["start", "end"]);
+    assert_eq!(param_names("items[$base + $offset]"), ["base", "offset"]);
+    assert_eq!(
+        param_names("string::startsWith(title, $prefix)"),
+        ["prefix"]
+    );
+    assert_eq!(param_names("references($id)"), ["id"]);
+    assert_eq!(param_names("* | order($field asc)"), ["field"]);
+    assert_eq!(param_names("!($flag)"), ["flag"]);
+    assert_eq!(param_names("($a, $b, $a)"), ["a", "b", "a"]);
+    assert_eq!(
+        param_names(
+            r#"*[_type == $type && references($id)][$start...$end]{title, "score": score($boost)}"#
+        ),
+        ["type", "id", "start", "end", "boost"]
+    );
+    // Repeated uses stay repeated, in source order, with distinct spans.
+    let src = "$id == $id";
+    let params = referenced_params(src);
+    assert_eq!(params[0].pos, Position { start: 0, end: 3 });
+    assert_eq!(params[1].pos, Position { start: 7, end: 10 });
+}
+
+#[test]
+fn test_referenced_params_skip_function_locals() {
+    // `$n` is local to the function. The same name outside it is a query param.
+    let src = "fn math::double($n) = $n * 2; *[_type == $n]";
+    let params = referenced_params(src);
+    assert_eq!(params.len(), 1);
+    assert_eq!(params[0].name, "n");
+    assert_eq!(params[0].pos.start, src.rfind("$n").unwrap());
+
+    // Other parameters used inside the body are query parameters.
+    assert_eq!(
+        param_names(
+            "fn pt::isPublished($doc) = $doc.publishedAt > $now && _type == $type; *[_type == $outer]"
+        ),
+        ["now", "type", "outer"]
+    );
+
+    // A name local to one function is not in scope for another function.
+    assert_eq!(
+        param_names("fn a::f($x) = $x + $shared; fn b::g($y) = $shared + $y; $top"),
+        ["shared", "shared", "top"]
+    );
+    assert_eq!(param_names("fn a::f($x) = $y; *"), ["y"]);
+}
+
+#[test]
+fn test_referenced_params_docs_custom_function_examples() {
+    // From https://www.sanity.io/docs/content-lake/custom-groq-functions
+    // `$person` is the function's own parameter, called with `@`, not a query param.
+    assert!(
+        param_names(
+            "fn ex::details($person) = $person{name, age};\n*[_type == \"person\"] { \"info\": ex::details(@) }"
+        )
+        .is_empty()
+    );
+    // `$type` outside the function is a query param.
+    assert_eq!(
+        param_names(
+            "fn ex::details($person) = $person{name, age};\n*[_type == $type] { \"info\": ex::details(@) }"
+        ),
+        ["type"]
+    );
+}
+
+#[test]
+fn test_referenced_params_docs_custom_function_shapes() {
+    // Other examples from the same custom-function docs. Each `$param` is the
+    // function's own parameter. None of these queries take a query parameter.
+    assert!(
+        param_names(
+            r#"fn ex::name($author) = $author-> { "name": firstName + " " + lastName };
+*[_type == "post"]{ "author": ex::name(author) }"#
+        )
+        .is_empty()
+    );
+    assert!(
+        param_names(
+            r#"fn ex::title($ref) = $ref->{title};
+*[_type == "person"] { "occupation": ex::title(occupation) }"#
+        )
+        .is_empty()
+    );
+    assert!(
+        param_names(
+            r#"fn ex::items($arr) = $arr[]{name};
+*[_type == "person"] { "stuff": ex::items(belongings) }"#
+        )
+        .is_empty()
+    );
+    assert!(
+        param_names(
+            r#"fn ex::pets($items) = $items[]->{name};
+*[_type == "person"] {"pet": ex::pets(pet)}"#
+        )
+        .is_empty()
+    );
+    assert!(
+        param_names(
+            r#"fn ex::blocks($arr) = $arr {
+  ...,
+  _type == "docsCallout" => {
+    ...,
+    content[] {
+      ...,
+      markDefs[] {
+        ...,
+        _type == "link" => {
+          isInternal,
+          _key,
+          _type,
+          reference->,
+          url
+        },
+        _type == "acronym" => {
+          _key,
+          _type,
+          value
+        }
+      }
+    }
+  }
+};
+*[_type == "article"] {
+  _id,
+  title,
+  "slug": slug.current,
+  "content": ex::blocks(content[])
+}"#
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn test_referenced_params_ignore_comments_and_strings() {
+    assert_eq!(
+        param_names("// $skipped\n*[_type == $type] // $alsoSkipped"),
+        ["type"]
+    );
+    assert_eq!(
+        param_names(r#"*[_type == "$type" && name == $name]"#),
+        ["name"]
+    );
+
+    let mut parser = Parser::new_with_config(
+        "// $skipped\n*[_type == $type]",
+        ParserConfig::without_param_validation().with_comments(),
+    );
+    let result = parser.parse().unwrap();
+    assert_eq!(
+        result
+            .referenced_params()
+            .iter()
+            .map(|param| param.name.as_str())
+            .collect::<Vec<_>>(),
+        ["type"]
+    );
+}
+
+#[test]
+fn test_referenced_params_with_validation_enabled() {
+    let mut parser = Parser::new_with_config(
+        "*[_type == $type && title == $title]",
+        ParserConfig::new().with_params(["type", "title"]),
+    );
+    let result = parser.parse().unwrap();
+    assert_eq!(
+        result
+            .referenced_params()
+            .iter()
+            .map(|param| param.name.as_str())
+            .collect::<Vec<_>>(),
+        ["type", "title"]
+    );
 }
 
 // ==================== COMMENTS ====================

@@ -396,6 +396,23 @@ pub struct ParseResult {
     pub comments: Vec<Comment>,
 }
 
+impl ParseResult {
+    /// Returns every reference to a query parameter, in source order.
+    ///
+    /// A parameter that is referenced more than once is returned once per
+    /// reference. References to a custom function's own parameters inside its
+    /// body are not included, since those are bound by the function rather
+    /// than supplied with the query.
+    pub fn referenced_params(&self) -> Vec<&Param> {
+        let mut params = Vec::new();
+        for function in &self.functions {
+            collect_referenced_params(&function.body, &function.parameters, &mut params);
+        }
+        collect_referenced_params(&self.expr, &[], &mut params);
+        params
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Hash, Eq)]
 pub struct FunctionID {
     pub namespace: String,
@@ -493,5 +510,81 @@ impl HasPosition for Expr {
             Expr::Slice(node) => node.get_pos(),
             Expr::Ellipsis(node) => node.get_pos(),
         }
+    }
+}
+
+fn collect_referenced_params<'a>(
+    expr: &'a Expr,
+    locals: &[FunctionParamDefinition],
+    out: &mut Vec<&'a Param>,
+) {
+    match expr {
+        Expr::Param(param) => {
+            if !locals.iter().any(|local| local.name == param.name) {
+                out.push(param);
+            }
+        }
+        Expr::Everything(_)
+        | Expr::This(_)
+        | Expr::Parent(_)
+        | Expr::Attribute(_)
+        | Expr::Literal(_)
+        | Expr::Ellipsis(_) => {}
+        Expr::Constraint(node) => collect_referenced_params(&node.expression, locals, out),
+        Expr::Object(node) => collect_referenced_params_in(&node.expressions, locals, out),
+        Expr::Array(node) => collect_referenced_params_in(&node.expressions, locals, out),
+        Expr::Subscript(node) => collect_referenced_params(&node.value, locals, out),
+        Expr::Range(node) => {
+            collect_referenced_params(&node.start, locals, out);
+            collect_referenced_params(&node.end, locals, out);
+        }
+        Expr::FunctionCall(node) => collect_referenced_params_in(&node.arguments, locals, out),
+        Expr::Binary(node) => {
+            collect_referenced_params(&node.lhs, locals, out);
+            collect_referenced_params(&node.rhs, locals, out);
+        }
+        Expr::Dot(node) => {
+            collect_referenced_params(&node.lhs, locals, out);
+            collect_referenced_params(&node.rhs, locals, out);
+        }
+        Expr::ArrayTraversal(node) => collect_referenced_params(&node.expr, locals, out),
+        Expr::Group(node) => collect_referenced_params(&node.expression, locals, out),
+        Expr::Tuple(node) => collect_referenced_params_in(&node.members, locals, out),
+        Expr::Pipe(node) => {
+            collect_referenced_params(&node.lhs, locals, out);
+            collect_referenced_params(&node.rhs, locals, out);
+        }
+        Expr::Prefix(node) => collect_referenced_params(&node.rhs, locals, out),
+        Expr::Postfix(node) => collect_referenced_params(&node.lhs, locals, out),
+        Expr::Projection(node) => {
+            collect_referenced_params(&node.lhs, locals, out);
+            collect_referenced_params_in(&node.object.expressions, locals, out);
+        }
+        Expr::FunctionPipe(node) => {
+            collect_referenced_params(&node.lhs, locals, out);
+            collect_referenced_params_in(&node.func.arguments, locals, out);
+        }
+        Expr::Filter(node) => {
+            collect_referenced_params(&node.lhs, locals, out);
+            collect_referenced_params(&node.constraint.expression, locals, out);
+        }
+        Expr::Element(node) => {
+            collect_referenced_params(&node.lhs, locals, out);
+            collect_referenced_params(&node.idx.value, locals, out);
+        }
+        Expr::Slice(node) => {
+            collect_referenced_params(&node.lhs, locals, out);
+            collect_referenced_params(&node.range.value, locals, out);
+        }
+    }
+}
+
+fn collect_referenced_params_in<'a>(
+    exprs: &'a [Expr],
+    locals: &[FunctionParamDefinition],
+    out: &mut Vec<&'a Param>,
+) {
+    for expr in exprs {
+        collect_referenced_params(expr, locals, out);
     }
 }
